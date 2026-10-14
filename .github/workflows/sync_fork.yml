@@ -1,44 +1,76 @@
 name: Fork Sync
 
 permissions:
-    contents: write
+  contents: write
 
 on:
-    schedule:
-        - cron: "0 0 * * *"  # 每天午夜执行
-    workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: "0 0 * * *" # 每天 UTC 00:00（北京时间 08:00）同步上游
+  workflow_dispatch: # 允许手动触发
+
+concurrency:
+  group: fork-sync-main
+  cancel-in-progress: false
 
 jobs:
-    sync_with_upstream:
-        name: Sync with Upstream
-        runs-on: ubuntu-latest
-        if: ${{ github.event.repository.fork }}
+  sync_with_upstream:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
 
-        steps:
-            - name: Checkout target repo
-              uses: actions/checkout@v5
-              with:
-                token: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-            - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.3
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: huangxd-/danmu_api
-                  upstream_sync_branch: main
-                  target_sync_branch: main
-                  test_mode: false
+      # 说明：GITHUB_TOKEN 永远无法获得 GitHub App 的 `workflows` 权限，
+      # 一旦上游改动了 .github/workflows 下的文件，推送到本 fork 就会被拒：
+      #   refusing to allow a GitHub App to create or update workflow ... without `workflows` permission
+      # 因此这里改为：代码/文档/测试照常同步，但把 .github/workflows 目录
+      # 在提交前还原成本仓库自己的版本，CI 配置不再跟随上游。
+      - name: Sync upstream (skip .github/workflows)
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            - name: Check for new commits
-              if: success()
-              run: echo "Sync completed successfully"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-            - name: Check for Failure
-              if: failure()
-              run: |
-                  echo "[Error] Sync failed. This might be due to:"
-                  echo "1. Changes in the upstream workflow file"
-                  echo "2. Merge conflicts that need manual resolution"
-                  echo "3. Network issues"
-                  echo "Please check the logs and consider manual sync if needed."
-                  exit 1
+          git remote add upstream https://github.com/huangxd-/danmu_api.git
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+              echo "::notice::Already up to date with upstream."
+              exit 0
+          fi
+
+          FORK_HEAD="$(git rev-parse HEAD)"
+          echo "Merging upstream/main into ${FORK_HEAD} ..."
+
+          if ! git merge --no-ff -m "Sync with upstream huangxd-/danmu_api" upstream/main; then
+              echo "::error::Merge conflict detected. Manual resolution required."
+              git merge --abort || true
+              exit 1
+          fi
+
+          # 把 .github/workflows 还原成合并前本仓库的版本（不向上游同步 CI 配置）
+          git rm -r --cached --quiet .github/workflows || true
+          rm -rf .github/workflows
+          git checkout "$FORK_HEAD" -- .github/workflows
+          git add -A .github/workflows
+
+          git commit --amend --no-edit -q
+
+          git push origin HEAD:main
+          echo "::notice::Fork sync completed."
+
+      - name: Check for Failure
+        if: failure()
+        run: |
+          echo "[Error] Sync failed. This might be due to:"
+          echo "1. Merge conflicts that need manual resolution"
+          echo "2. Network issues"
+          echo "Please check the logs and consider manual sync if needed."
+          exit 1
